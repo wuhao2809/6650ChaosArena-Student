@@ -1,0 +1,20 @@
+# Binaries
+server
+*.exe
+
+# Terraform
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+**/.terraform.lock.hcl
+**/terraform.tfvars
+
+# Environment
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Go
+vendor/
