@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log() { echo "==> $*"; }
 
 log "Running terraform (creates ECR repo if needed)..."
-terraform -chdir="$SCRIPT_DIR/terraform" init -upgrade -reconfigure
+terraform -chdir="$SCRIPT_DIR/terraform" init -upgrade
 terraform -chdir="$SCRIPT_DIR/terraform" apply -auto-approve \
   -var="aws_region=${REGION}" \
   -var="image_tag=latest"
