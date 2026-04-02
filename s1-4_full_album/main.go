@@ -53,6 +53,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", app.handleHealth)
+	mux.HandleFunc("/albums", app.handleListAlbums) // S6: exact match, no trailing slash
 	mux.HandleFunc("/albums/", app.handleAlbums)
 
 	log.Printf("listening on :%s (albums=%s photos=%s bucket=%s)", port, albumsTable, photosTable, bucket)
@@ -114,6 +115,22 @@ func (a *App) handleAlbums(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
+}
+
+// handleListAlbums satisfies S6: GET /albums returns all albums.
+func (a *App) handleListAlbums(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	albums, err := a.albumStore.List(r.Context())
+	if err != nil {
+		log.Printf("list albums: %v", err)
+		http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(albums)
 }
 
 // handlePutAlbum satisfies S2 (create).

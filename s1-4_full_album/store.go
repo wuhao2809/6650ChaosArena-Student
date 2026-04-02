@@ -57,6 +57,20 @@ func (s *AlbumStore) Get(ctx context.Context, albumID string) (*Album, error) {
 	return &album, nil
 }
 
+func (s *AlbumStore) List(ctx context.Context) ([]Album, error) {
+	out, err := s.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName: aws.String(s.table),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var albums []Album
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &albums); err != nil {
+		return nil, err
+	}
+	return albums, nil
+}
+
 // ---------------------------------------------------------------------------
 // Photos
 // ---------------------------------------------------------------------------

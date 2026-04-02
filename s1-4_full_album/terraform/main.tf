@@ -164,6 +164,7 @@ resource "aws_iam_role_policy" "task" {
           "dynamodb:PutItem",
           "dynamodb:UpdateItem",
           "dynamodb:DeleteItem",
+          "dynamodb:Scan",
         ]
         Resource = [
           aws_dynamodb_table.albums.arn,
