@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -164,30 +165,30 @@ func (a *App) handleGetAlbum(w http.ResponseWriter, r *http.Request, albumID str
 	json.NewEncoder(w).Encode(album)
 }
 
-// handlePostPhoto — streaming design for low accept latency (S15).
-//
-// The key insight: we can find the multipart "photo" part by reading only its
-// headers (~200 bytes), assign seq and write metadata, send 202, then stream
-// the actual file bytes through a pipe to S3 — all without ever holding the
-// full payload in memory.
+// handlePostPhoto — buffer-then-upload design.
 //
 // Timeline:
-//   t=0      r.MultipartReader() + NextPart()  — reads ~200 bytes of headers
-//   t≈20ms   IncrementPhotoSeq + photoStore.Put — two DynamoDB round-trips
-//   t≈20ms   202 sent + flushed                 ← accept latency ends here
-//   t≈20ms…  io.Copy(pw, part)  feeds the pipe in the handler goroutine
-//              s3manager drains the pipe into S3 in a background goroutine
-//   t≈Xs     S3 upload completes, ConditionalUpdateStatus marks "completed"
+//   t=0      r.MultipartReader() + NextPart()  — reads part headers
+//   t=0…     io.ReadAll(part)                  — buffers full body from r.Body
+//   t≈Xms    IncrementPhotoSeq + photoStore.Put — two DynamoDB round-trips
+//   t≈Xms    202 sent                           ← accept latency ends here
+//   t≈Xms…   background goroutine uploads from bytes.NewReader to S3
+//   t≈Ys     S3 upload completes, ConditionalUpdateStatus marks "completed"
 //
-// s3manager uses S3 multipart upload for the io.PipeReader (non-seekable),
-// which requires CreateMultipartUpload / UploadPart / CompleteMultipartUpload
-// IAM permissions — these are granted in terraform/main.tf.
+// Why buffer first: the ALB closes the backend TCP connection once it has
+// forwarded the 202 response to the client.  Any attempt to read r.Body after
+// WriteHeader returns therefore receives an unexpected EOF.  Buffering the
+// full body synchronously before writing any response avoids this entirely.
+//
+// bytes.NewReader is seekable and has a known length, so the S3 transfer
+// manager uses a single PutObject call instead of multipart upload — no
+// additional IAM permissions required beyond s3:PutObject.
 //
 // ConditionalUpdateStatus uses attribute_exists(photo_id): if DELETE races
 // the upload and wins, the goroutine's "completed" write is silently dropped
 // rather than resurrecting the deleted record (S9).
 func (a *App) handlePostPhoto(w http.ResponseWriter, r *http.Request, albumID string) {
-	// 1. Locate the "photo" part — reads multipart boundary + part headers only.
+	// 1. Locate the "photo" part.
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, `{"error":"bad multipart"}`, http.StatusBadRequest)
@@ -212,7 +213,17 @@ func (a *App) handlePostPhoto(w http.ResponseWriter, r *http.Request, albumID st
 	}
 	defer part.Close()
 
-	// 2. Assign seq atomically and write the metadata record — before 202.
+	// 2. Buffer the full body while r.Body is still reliably open.
+	//    Must happen before WriteHeader — the ALB closes the backend connection
+	//    after forwarding the response, making subsequent r.Body reads fail.
+	photoData, err := io.ReadAll(part)
+	if err != nil {
+		log.Printf("read photo body %s: %v", albumID, err)
+		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 3. Assign seq atomically and write the metadata record.
 	seq, err := a.albumStore.IncrementPhotoSeq(r.Context(), albumID)
 	if err != nil {
 		log.Printf("increment seq %s: %v", albumID, err)
@@ -231,12 +242,7 @@ func (a *App) handlePostPhoto(w http.ResponseWriter, r *http.Request, albumID st
 		return
 	}
 
-	// 3. Send 202 with explicit Content-Length.
-	//
-	// Without Content-Length, Go uses chunked transfer encoding and the
-	// client's io.ReadAll(resp.Body) blocks until the handler returns.
-	// With Content-Length, the client unblocks after N bytes — even though
-	// the handler is still streaming to S3 in the background.
+	// 4. Send 202.
 	respBody, _ := json.Marshal(map[string]interface{}{
 		"photo_id": photoID,
 		"seq":      seq,
@@ -246,33 +252,11 @@ func (a *App) handlePostPhoto(w http.ResponseWriter, r *http.Request, albumID st
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(http.StatusAccepted)
 	w.Write(respBody) //nolint:errcheck
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
 
-	// 4. Stream file bytes: handler goroutine → pipe → S3 upload goroutine.
-	//
-	// The handler must stay alive (not return) because returning closes r.Body,
-	// which would EOF the multipart reader mid-stream.  io.Copy in the handler
-	// feeds the pipe; the upload goroutine drains it.
-	pr, pw := io.Pipe()
-
+	// 5. Upload to S3 from the buffered data.
+	//    bytes.NewReader is seekable — S3 manager uses PutObject directly.
 	go func() {
-		// If the upload stops consuming pr (e.g. S3 error), pr.CloseWithError
-		// propagates back to pw.Write in io.Copy, unblocking the handler.
-		var uploadErr error
-		defer func() {
-			if uploadErr != nil {
-				pr.CloseWithError(uploadErr)
-			} else {
-				pr.Close()
-			}
-		}()
-
-		// Background context: request context is cancelled when handler returns,
-		// but the upload must outlive the handler.
-		var url string
-		url, uploadErr = a.s3svc.UploadStream(context.Background(), albumID, photoID, pr)
+		url, uploadErr := a.s3svc.UploadStream(context.Background(), albumID, photoID, bytes.NewReader(photoData))
 		if uploadErr != nil {
 			log.Printf("s3 upload %s/%s: %v", albumID, photoID, uploadErr)
 			a.photoStore.ConditionalUpdateStatus(context.Background(), albumID, photoID, "failed", "")
@@ -284,14 +268,6 @@ func (a *App) handlePostPhoto(w http.ResponseWriter, r *http.Request, albumID st
 			log.Printf("update completed %s/%s: %v", albumID, photoID, err)
 		}
 	}()
-
-	// Feed the pipe from the request body.  Blocks until all bytes are copied
-	// or the upload goroutine signals an error via pr.CloseWithError.
-	if _, copyErr := io.Copy(pw, part); copyErr != nil {
-		pw.CloseWithError(copyErr)
-		return
-	}
-	pw.Close()
 }
 
 func (a *App) handleGetPhoto(w http.ResponseWriter, r *http.Request, albumID, photoID string) {
